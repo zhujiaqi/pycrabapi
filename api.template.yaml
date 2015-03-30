@@ -1,0 +1,14 @@
+uwsgi:
+    http: : 18888
+    master: true
+    chdir: /home/sysop/api/dev_api/
+    module: japi
+    home: /home/sysop/virtual/
+    pidfile: devapi.pid
+    uid: sysop
+    gid: sysop
+    processes: 2
+    daemonize: /home/sysop/api/dev_api/api.log
+    logformat: ``%(addr) - %(user) [%(ltime)] "%(method) %(uri) %(proto)" %(status) %(size)`` "%(referer)" "%(uagent)" %(msecs) %(pid)
+    log-maxsize: 1234567890
+    worker-reload-mercy: 10
