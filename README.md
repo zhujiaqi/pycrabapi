@@ -1,7 +1,5 @@
 # pycrabapi
 
-Drop in Python API for projects not so big
-
 ### Key Features
 
 * Run out of box HTTP API...can be restful too if you like
