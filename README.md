@@ -1,5 +1,10 @@
 # pycrabapi
 
+### Credit
+
+(lqs) https://github.com/lqs - original writer
+(mapcan) https://github.com/mapcan - wrote logger
+
 ### Key Features
 
 * Run out of box HTTP API...can be restful too if you like
