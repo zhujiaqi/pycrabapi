@@ -17,5 +17,8 @@ def realize(obj):
     if isinstance(obj, (datetime.date, datetime.time)):
         return str(obj)
     if isinstance(obj, Decimal):
-        return float(obj)
+        return round(obj, 2)
+    if isinstance(obj, time.struct_time):
+        return time.strftime('%Y-%m-%d %H:%M:%S', obj)
     return obj
+

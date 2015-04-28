@@ -15,15 +15,21 @@ class MySQL():
         self.timestamp = time.time()
 
     def reconnect(self):
+        flag = 0
         new_ts = time.time()
-        if new_ts - self.timestamp > 3600:
+        if new_ts - self.timestamp > 7200:
             try:
                 self.conn.close()
             except pymysql.OperationalError, e:
-                print e
-                pass
+                print e, 'reconnect error'
             self.conn = pymysql.connect(**self.config)
+            flag = 1
         self.timestamp = new_ts
+        return flag
+
+    def commit(self):
+        self.reconnect()
+        self.conn.commit()
 
     def execute_once(self, query, params):
         self.reconnect()

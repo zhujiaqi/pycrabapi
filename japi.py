@@ -13,7 +13,6 @@ import urllib
 import datetime
 import time
 import hashlib
-import urllib2
 import json
 from StringIO import StringIO
 from exceptions import BaseException
@@ -22,7 +21,6 @@ import config
 
 from helpers.error import *
 from helpers.util import realize
-#from helpers import account
 from helpers import mail
 
 from singletons import mysql_conn, rds
@@ -35,8 +33,16 @@ def _check_limit_exceed(ua_ip_hash):
     current_time = int(time.time() / 60) #per 60 seconds
     key = 'timelimit:%s%s' % (ua_ip_hash, current_time)
     current_limit = rds.get(key)
-    print key, current_limit
     if current_limit is not None and int(current_limit) > 1000:
+        mail_key = 'timelimit_exceed:%s' % (ua_ip_hash)
+        mail_limit = rds.get(mail_key)
+        if mail_limit is None:
+            email_body = '<p>Limit Exceeded:%s</p><br><p>Value:%s(%s)</p>' % (ua_ip_hash, current_limit, 1000)
+            mail.send(['admin@mydomain.com'], email_body, 'API Limit Exceeded（%s）（%s）' % (str(datetime.datetime.now()), config.STAGE), True)
+            p = rds.pipeline()
+            p.set(mail_key, 1)
+            p.expire(mail_key, 3600)
+            p.execute()
         return True
     else:
         p = rds.pipeline()
@@ -53,21 +59,21 @@ def _log_me(args, me):
     else:
         return 0
 
-def _format_error(me, status, data, message):
+def _format_error(me, api_error):
     return {
         'version': 1,
         'meta': {
-            'status': int(status),
-            'errdata': data,
-            'errmsg': message,
+            'status': api_error.code,
+            'errdata': api_error.data,
+            'errmsg': api_error.get_message(),
             'cost': 0.0,
-            'server_time': datetime.datetime.utcnow(),
+            'server_time': datetime.datetime.now(),
             'account_id': me and me['id'] or 0,
         },
         'data': None
     }
 
-def _get_error(path, args, me, exception):
+def _log_error(path, args, me, exception):
     if isinstance(exception, CustomError):
         if exception.code != 10001:
             error_info = [
@@ -79,7 +85,6 @@ def _get_error(path, args, me, exception):
             ]
             error_info = map(str, error_info)
             error_log.error('\t'.join(error_info))
-        return _format_error(me, exception.code, exception.data, exception.get_message())
     elif exc and isinstance(exception, exc):
         f = StringIO()
         traceback.print_exc(None, f)
@@ -89,10 +94,7 @@ def _get_error(path, args, me, exception):
         panic_info = map(str, panic_info)
         panic_log.critical('\t'.join(panic_info))
         email_body = '<br>'.join(panic_info)
-        #mail.send(['me@mydomain.com'], email_body, 'API Error（%s）' % str(datetime.datetime.now()), True)
-        return _format_error(me, 10034, None, str(exception))
-    else:
-        raise
+        mail.send(['admin@mydomain.com'], email_body, 'Server Error（%s）（%s）' % (str(datetime.datetime.now()), config.STAGE), True)
 
 def _copy_dict_with_limited_value_length(o):
     res = {}
@@ -101,19 +103,22 @@ def _copy_dict_with_limited_value_length(o):
             res[k] = v
     return res
 
-def process_action(path, args, me):
+def process_action(orig_path, args, me):
+    path = orig_path
     path = path.strip('/')
     r = path.split('/')
 
     if len(r) < 1:
-        return None, 10035
+        api_error = CustomError(10035)
+        return _format_error(me, api_error), api_error
 
     m = loaded_controllers.get(r[0])
     if m is None:
         try:
             m = imp.find_module(r[0], ['controllers'])
         except ImportError, e:
-            return None, 10035
+            api_error = CustomError(10035)
+            return _format_error(me, api_error), api_error
 
         m = imp.load_module(r[0], *m)
         loaded_controllers[r[0]] = m
@@ -122,28 +127,55 @@ def process_action(path, args, me):
     except:
         action = None
     if not action:
-        return None, 10035
+        api_error = CustomError(10036)
+        return _format_error(me, api_error), api_error
     else:
         args['URIARGS'] = '/'.join(r[1:])
 
     time1 = time.time()
     meta = {
         'version': 1,
+        'update_db': False,
     }
-    res = action(args, me, meta)
-    time2 = time.time()
+
+    res = None
+    api_error = None
+    try:
+        res = action(args, me, meta)
+        mysql_conn.commit()
+    except exc, e:
+        _log_error(orig_path, args, me, e)
+        if not isinstance(e, CustomError):
+            api_error = CustomError(10034, str(e))
+        else:
+            api_error = e
+        if meta['update_db']:
+            mysql_conn.conn.rollback()
+    finally:
+        time2 = time.time()
+        meta['cost'] = time2 - time1
+        app_log.info('%s\t<%s>\t%.4f\t%s' % (
+            orig_path,
+            _log_me(args, me),
+            meta['cost'],
+            str(args['ip']))
+        )
+        debug_log.info('%s\t<%s>\t%.4f\t%s' % (
+            orig_path,
+            _log_me(args, me),
+            meta['cost'],
+            urllib.urlencode(_copy_dict_with_limited_value_length(args)))
+        )
     res = {
-        'meta': {},
+        'meta': meta,
         'data': res
     }
     meta['account_id'] = me and me['id'] or 0
-    meta['cost'] = time2 - time1
     meta['server_time'] = datetime.datetime.now()
-    meta['status'] = 0
-    meta['errdata'] = None
-    meta['errmsg'] = ''
-    res['meta'] = meta
-    return res, 0
+    meta['status'] = api_error and api_error.code or 0
+    meta['errdata'] = api_error and api_error.data or None
+    meta['errmsg'] = api_error and api_error.get_message() or ''
+    return res, api_error
 
 def _build_args(environ):
     args = {}
@@ -154,7 +186,6 @@ def _build_args(environ):
             safe_env[key] = val
 
     args['REQUEST_METHOD'] = safe_env['REQUEST_METHOD']
-
     post_data_list = cgi.FieldStorage(fp=environ['wsgi.input'], environ=safe_env, keep_blank_values=True).list
     for item in post_data_list:
         args[item.name] = unicode(item.value, 'utf-8')
@@ -164,7 +195,7 @@ def _build_args(environ):
         args[k] = unicode(v[0], 'utf-8')
 
     client_ip = environ.get('HTTP_X_REAL_IP') or environ['REMOTE_ADDR']
-
+    
     if client_ip.startswith('127.') or client_ip.startswith('10.') or client_ip.startswith('192.'):
         forwarded_for = environ.get('HTTP_X_FORWARDED_FOR')
         if forwarded_for:
@@ -180,8 +211,7 @@ def _build_args(environ):
 def _check_auth(environ):
     token = environ.get('HTTP_' + config.TOKEN_HEADER)
     if token:
-        #TODO: verify token
-        acc = {'id': 0}
+        acc = {'id': 0} #TODO: verify token
         return acc
 
 def application(environ, start_response):
@@ -198,86 +228,64 @@ def application(environ, start_response):
         res = ''
         headers.append(('Content-Type', 'image/x-icon'))
     else:
-        status = 0
         api_error = None
         me = None
         args = _build_args(environ)
         if hasattr(config, 'IS_DOWN') and config.IS_DOWN == True:
-            status = 10001
+            api_error = CustomError(10001)
+            res = _format_error(me, api_error)
         else:
             if _check_limit_exceed(args['ua_ip_hash']):
-                status = 10030
+                api_error = CustomError(10030)
+                res = _format_error(me, api_error)
             else:
                 auth = _check_auth(environ)
                 if auth:
                     me = auth
                 if 'force_auth' in args and not me:
-                    status = 20010
+                    api_error = CustomError(20010)
+                    res = _format_error(me, api_error)
 
-            start_time = datetime.datetime.now()
-            res = None
-            try:
-                if not status:
-                    res, status = process_action(environ['PATH_INFO'], args, me)
-                    mysql_conn.conn.commit()
-            except exc, e:
-                api_error = e
-                mysql_conn.conn.rollback()
-            finally:
-                api_cost = datetime.datetime.now() - start_time
-                api_cost = api_cost.seconds + api_cost.microseconds / 1000000.0
-                app_log.info('%s\t<%s>\t%.4f\t%s' % (
-                    environ['PATH_INFO'],
-                    _log_me(args, me),
-                    api_cost,
-                    str(args['ip']))
-                )
-                debug_log.info('%s\t<%s>\t%.4f\t%s' % (
-                    environ['PATH_INFO'],
-                    _log_me(args, me),
-                    api_cost,
-                    urllib.urlencode(_copy_dict_with_limited_value_length(args)))
-                )
-
-        if status:
-            api_error = CustomError(status, None)
+            if not api_error:
+                res, api_error = process_action(environ['PATH_INFO'], args, me)
 
         if api_error:
-            res = _get_error(environ['PATH_INFO'], args, me, api_error)
-            if res['meta']['status'] in [20010, ]:
+            if api_error.code in (20010, 20026, 20022):
                 response_header = '401 Unauthorized'
-            elif res['meta']['status'] >= 90000 and res['meta']['status'] <= 99999:
-                response_header = res['meta']['errmsg']
-            elif res['meta']['status'] == 10030:
+                headers.append(('WWW-Authenticate', 'Digest realm="wtf"'))
+            elif api_error.code >= 90000 and api_error.code <= 99999:
+                response_header = api_error.get_message()
+            elif api_error.code == 10030:
                 response_header = '429 Too Many Requests'
             else:
                 response_header = '500 Internal Server Error'
 
-        callback = args.get('callback')
-        if callback and not api_error:
-            start_response('301 Redirect', [('Location', callback.encode('utf8')),])
-            return []
-        elif res['meta'].get('force_txt') and not api_error:
-            headers.append(('Content-Type', 'text/plain; charset=utf-8'))
-            res = res['data']
         else:
-            res = json.dumps(realize(res))
-            headers.append(('Content-Type', 'application/json; charset=utf-8'))
+            callback = args.get('callback')
+            if callback:
+                start_response('301 Redirect', [('Location', callback.encode('utf8')),])
+                return []
+            elif res['meta'].get('force_txt'):
+                headers.append(('Content-Type', 'text/plain; charset=utf-8'))
+                res = res['data']
 
-    etag = '"' + hashlib.md5(res).hexdigest()[:16] + '"'
-    headers.append(('ETag', etag))
-    if environ.get('HTTP_IF_NONE_MATCH') == etag:
-        start_response('304 Not Modified', [])
-        return {}
+        res = json.dumps(realize(res))
+        headers.append(('Content-Type', 'application/json; charset=utf-8'))
 
-    if use_gzip:
-        headers.append(('Content-Encoding', 'gzip'))
-        resio = StringIO()
-        g = gzip.GzipFile(mode='wb', fileobj=resio)
-        g.write(res)
-        g.close()
-        resio.seek(0)
-        res = resio.read()
+        etag = '"' + hashlib.md5(res).hexdigest()[:16] + '"'
+        headers.append(('ETag', etag))
+        if environ.get('HTTP_IF_NONE_MATCH') == etag:
+            start_response('304 Not Modified', [])
+            return {}
+
+        if use_gzip:
+            headers.append(('Content-Encoding', 'gzip'))
+            resio = StringIO()
+            g = gzip.GzipFile(mode='wb', fileobj=resio)
+            g.write(res)
+            g.close()
+            resio.seek(0)
+            res = resio.read()
 
     content_length = len(res)
     headers.append(('Content-Length', str(content_length)))
