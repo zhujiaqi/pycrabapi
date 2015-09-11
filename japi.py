@@ -186,32 +186,43 @@ def _build_args(environ):
             safe_env[key] = val
 
     args['REQUEST_METHOD'] = safe_env['REQUEST_METHOD']
-    post_data_list = cgi.FieldStorage(fp=environ['wsgi.input'], environ=safe_env, keep_blank_values=True).list
-    for item in post_data_list:
-        args[item.name] = unicode(item.value, 'utf-8')
+    post_data = cgi.FieldStorage(fp=environ['wsgi.input'], environ=safe_env, keep_blank_values=True)
+
+    if safe_env.get('CONTENT_TYPE'):
+        if safe_env['CONTENT_TYPE'].startswith('application/x-www-form-urlencoded') or safe_env['CONTENT_TYPE'].startswith('multipart/form-data'):
+            for item in post_data.list:
+                args[item.name] = unicode(item.value, 'utf-8')
+        elif safe_env['CONTENT_TYPE'] == 'application/json':
+            try:
+                json_data = json.loads(post_data.file.read())
+            except:
+                return
+            #print json_data
+            for key, value in json_data.items():
+                args[key] = value
+        else:
+            print safe_env['CONTENT_TYPE']
+            return
 
     params = cgi.parse_qs(environ['QUERY_STRING'])
     for k, v in params.iteritems():
-        args[k] = unicode(v[0], 'utf-8')
+        args[k] = unicode(v[0], 'utf-8') 
 
-    client_ip = environ.get('HTTP_X_REAL_IP') or environ['REMOTE_ADDR']
-    
+    client_ip = environ.get('HTTP_X_REAL_IP') or environ['REMOTE_ADDR'] or ''
     if client_ip.startswith('127.') or client_ip.startswith('10.') or client_ip.startswith('192.'):
         forwarded_for = environ.get('HTTP_X_FORWARDED_FOR')
         if forwarded_for:
-            forwarded_for = forwarded_for.split(',')
-            client_ip = forwarded_for[-1].strip()
-            if client_ip.startswith('127.'):
-                client_ip = forwarded_for[-1].strip()
+            client_ip = forwarded_for
+    client_ip = client_ip.split(',')[0].strip()
 
-    args['ip'] = client_ip[:20]
+    args['ip'] = client_ip
     args['ua_ip_hash'] = hashlib.md5(client_ip + '|' + environ.get('HTTP_USER_AGENT', '')).hexdigest()
     return args
 
 def _check_auth(environ):
     token = environ.get('HTTP_' + config.TOKEN_HEADER)
     if token:
-        acc = {'id': 0} #TODO: verify token
+        acc = {'id': 0} #TODO: verify account
         return acc
 
 def application(environ, start_response):
@@ -231,26 +242,32 @@ def application(environ, start_response):
         api_error = None
         me = None
         args = _build_args(environ)
-        if hasattr(config, 'IS_DOWN') and config.IS_DOWN == True:
-            api_error = CustomError(10001)
+        if args is None:
+            api_error = CustomError(10002)
             res = _format_error(me, api_error)
         else:
-            if _check_limit_exceed(args['ua_ip_hash']):
-                api_error = CustomError(10030)
+            if hasattr(config, 'IS_DOWN') and config.IS_DOWN == True:
+                api_error = CustomError(10001)
                 res = _format_error(me, api_error)
             else:
-                auth = _check_auth(environ)
-                if auth:
-                    me = auth
-                if 'force_auth' in args and not me:
-                    api_error = CustomError(20010)
+                if _check_limit_exceed(args['ua_ip_hash']):
+                    api_error = CustomError(10030)
                     res = _format_error(me, api_error)
+                else:
+                    auth = _check_auth(environ)
+                    if auth:
+                        me = auth
+                        if me.get('is_session_id'):
+                            args['session_id'] = int(me['id'])
+                    if 'force_auth' in args and not me:
+                        api_error = CustomError(20010)
+                        res = _format_error(me, api_error)
 
-            if not api_error:
-                res, api_error = process_action(environ['PATH_INFO'], args, me)
+                if not api_error:
+                    res, api_error = process_action(environ['PATH_INFO'], args, me)
 
         if api_error:
-            if api_error.code in (20010, 20026, 20022):
+            if api_error.code >= 20010 and api_error.code <= 26999:
                 response_header = '401 Unauthorized'
                 headers.append(('WWW-Authenticate', 'Digest realm="wtf"'))
             elif api_error.code >= 90000 and api_error.code <= 99999:
